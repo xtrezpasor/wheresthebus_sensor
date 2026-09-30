@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Last updated: 2026-09-30 10:46:08 AM EDT (America/New_York)
+# Last updated: 2026-09-30 04:00:50 PM EDT (America/New_York)
 """Read WheresTheBus data for a Home Assistant command_line sensor.
 
 Adds AM/PM stop information and a conservative GPS-movement ETA fallback.
@@ -390,6 +390,10 @@ def read_buses(cache, tracking_state):
 
         track_key = f"{child_id}:{period}"
         previous = tracking_state.get(track_key, {})
+        service_day = now.astimezone(LOCAL_TIMEZONE).date().isoformat()
+        # Tracking and drop-off status must never carry into a new local day.
+        if previous.get("service_day") != service_day:
+            previous = {}
         samples = previous.get("samples", [])
         if not isinstance(samples, list):
             samples = []
@@ -422,17 +426,21 @@ def read_buses(cache, tracking_state):
         else:
             near_at = was_near
 
-        dropped_off_likely = False
+        dropoff_at = previous.get("dropoff_likely_at")
+        new_dropoff_detected = False
         if period == "pm" and gps_fresh and stop_distance is not None and was_near:
             try:
                 candidate_at = datetime.fromisoformat(was_near)
                 elapsed = now - candidate_at
-                dropped_off_likely = (
+                new_dropoff_detected = (
                     timedelta(0) <= elapsed <= timedelta(minutes=20)
                     and stop_distance >= LEFT_STOP_MILES
                 )
             except (TypeError, ValueError):
                 pass
+        if new_dropoff_detected and not dropoff_at:
+            dropoff_at = now.isoformat(timespec="seconds")
+        dropped_off_likely = bool(dropoff_at)
         if dropped_off_likely:
             near_at = None
         elif near_at:
@@ -442,7 +450,17 @@ def read_buses(cache, tracking_state):
             except (TypeError, ValueError):
                 near_at = None
 
-        new_track[track_key] = {"samples": samples, "near_stop_at": near_at}
+        # Once the bus has likely completed this rider's stop, later bus GPS
+        # movement must not create another arrival or ETA for the same day.
+        if dropped_off_likely:
+            backup_eta = None
+            eta_reason = "likely_dropoff_already_detected"
+        new_track[track_key] = {
+            "service_day": service_day,
+            "samples": samples,
+            "near_stop_at": near_at,
+            "dropoff_likely_at": dropoff_at,
+        }
         app_eta = parse_app_eta(rider.get("etaMsg"))
         app_distance = number(rider.get("dist"))
         # Respect API unit flag when converting its displayed distance.
@@ -458,12 +476,20 @@ def read_buses(cache, tracking_state):
         else:
             arrival_reason = "fresh_gps_outside_arrival_radius"
 
+        arrival_likely = bool(near_now and not dropped_off_likely)
+        if dropped_off_likely and not new_dropoff_detected:
+            arrival_reason = "likely_dropoff_already_detected_for_service_day"
+
         if period != "pm":
             dropoff_reason = "not_pm_route_window"
         elif not gps_fresh:
             dropoff_reason = "bus_location_stale_or_missing"
-        elif dropped_off_likely:
-            dropoff_reason = "bus_departed_stop_after_recent_proximity"
+        elif dropoff_at:
+            dropoff_reason = (
+                "bus_departed_stop_after_recent_proximity"
+                if new_dropoff_detected
+                else "likely_dropoff_already_detected_for_service_day"
+            )
         elif near_now:
             dropoff_reason = "bus_near_stop_waiting_for_departure_evidence"
         elif was_near:
@@ -496,7 +522,7 @@ def read_buses(cache, tracking_state):
             "stop_longitude": stop["stop_longitude"],
             "stop_source": stop["stop_source"],
             "stop_distance_miles": stop_distance,
-            "arrival_likely": bool(near_now),
+            "arrival_likely": arrival_likely,
             "arrival_reason": arrival_reason,
             "dropped_off_likely": bool(dropped_off_likely),
             "dropoff_reason": dropoff_reason,
@@ -527,7 +553,7 @@ def read_buses(cache, tracking_state):
             closing_intervals=closing_intervals,
             eta_minutes=backup_eta,
             eta_reason=eta_reason,
-            arrival_likely=bool(near_now),
+            arrival_likely=arrival_likely,
             arrival_reason=arrival_reason,
             dropped_off_likely=bool(dropped_off_likely),
             dropoff_reason=dropoff_reason,
