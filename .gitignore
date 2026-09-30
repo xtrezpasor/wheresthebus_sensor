@@ -1,0 +1,8 @@
+# Never commit Home Assistant credentials or local runtime state.
+wtb_credentials.json
+wtb_session.json
+wtb_history_state.json
+wtb_tracking_state.json
+wtb_history/
+__pycache__/
+*.py[cod]
