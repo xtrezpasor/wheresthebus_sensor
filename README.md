@@ -27,3 +27,27 @@ docker exec homeassistant python /config/wheresthebus_sensor.py --now
 ```
 
 The command should print one JSON object containing `state` and `buses`. Daily diagnostics are written under `/config/wtb_history/diagnostics/` and retained for 30 days.
+
+## Alert when the sensor has an error
+
+The Python script emits `state: error` and an `error_type` attribute when login, API, configuration, or another run fails. Home Assistant must reload that JSON through the existing command-line sensor. Add the automation below to `automations.yaml` (or import `bus_error_alert.yaml` in your Home Assistant setup), then reload automations. It sends one phone alert when the sensor first enters the error state, avoiding a push every poll while the issue persists.
+
+```yaml
+- id: wheresthebus_sensor_error
+  alias: Where's the Bus sensor error alert
+  description: Notify when the bus sensor cannot log in or retrieve data.
+  triggers:
+    - trigger: state
+      entity_id: sensor.where_s_my_bus
+      to: "error"
+  actions:
+    - action: notify.mobile_app_evan_5182218310
+      data:
+        title: Where's the Bus sensor needs attention
+        message: >-
+          The bus sensor reported an error ({{ state_attr('sensor.where_s_my_bus', 'error_type') or 'unknown error' }}).
+          Check /config/wtb_credentials.json and the sensor diagnostics under /config/wtb_history/diagnostics/.
+  mode: single
+```
+
+If your phone's notify service has a different name, replace `notify.mobile_app_evan_5182218310` with the service listed under Home Assistant Developer Tools → Actions. The automation triggers when the sensor changes into `error`; if the command-line sensor is `unavailable` instead, inspect its command and timeout configuration.
