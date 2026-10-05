@@ -1,0 +1,15 @@
+- id: wheresthebus_sensor_error
+  alias: Where's the Bus sensor error alert
+  description: Notify when the bus sensor cannot log in or retrieve data.
+  triggers:
+    - trigger: state
+      entity_id: sensor.where_s_my_bus
+      to: "error"
+  actions:
+    - action: notify.mobile_app_evan_5182218310
+      data:
+        title: Where's the Bus sensor needs attention
+        message: >-
+          The bus sensor reported an error ({{ state_attr('sensor.where_s_my_bus', 'error_type') or 'unknown error' }}).
+          Check /config/wtb_credentials.json and the sensor diagnostics under /config/wtb_history/diagnostics/.
+  mode: single
