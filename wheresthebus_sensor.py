@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Last updated: 2026-10-07 04:44 PM EDT (America/New_York)
+# Last updated: 2026-10-07 05:08 PM EDT (America/New_York)
 """Read WheresTheBus data for a Home Assistant command_line sensor.
 
 Adds AM/PM stop information and a conservative GPS-movement ETA fallback.
@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,11 @@ HISTORY_DIR = Path("/config/wtb_history")
 HISTORY_STATE = Path("/config/wtb_history_state.json")
 TRACKING_STATE = Path("/config/wtb_tracking_state.json")
 ETA_SPEED_CACHE = Path("/config/wtb_eta_speed_cache.json")
+FORECAST_STATE = Path("/config/wtb_forecast_state.json")
+OLLAMA_CONFIG = Path("/config/wtb_ollama.json")
+OLLAMA_STATE = Path("/config/wtb_ollama_analysis_state.json")
+OLLAMA_ANALYSIS_DIR = HISTORY_DIR / "ollama_analysis"
+OLLAMA_LOCK = Path("/config/wtb_ollama_analysis.lock")
 DIAGNOSTICS_DIR = HISTORY_DIR / "diagnostics"
 LOCAL_TIMEZONE = ZoneInfo("America/New_York")
 
@@ -62,6 +68,9 @@ HISTORICAL_ETA_LOOKBACK_DAYS = 30
 HISTORICAL_ETA_CACHE_HOURS = 6
 HISTORICAL_ETA_MIN_SAMPLES = 10
 HISTORICAL_ETA_MIN_DAYS = 1
+FORECAST_HORIZONS_MINUTES = (1, 3, 5, 10)
+FORECAST_ISSUE_INTERVAL_MINUTES = 1
+FORECAST_MAX_SPEED_MPH = 55.0
 RUN_ID = "startup"
 
 
@@ -260,6 +269,253 @@ def haversine_miles(lat1, lon1, lat2, lon2):
     dl = math.radians(float(lon2) - float(lon1))
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * radius_miles * math.asin(min(1.0, math.sqrt(a)))
+
+
+def predict_positions(samples, lat, lon, now):
+    """Extrapolate short-horizon positions from recent measured GPS motion."""
+    points = []
+    for sample in samples[-5:]:
+        try:
+            at = datetime.fromisoformat(sample["at"])
+            s_lat, s_lon = float(sample["lat"]), float(sample["lon"])
+            if valid_coordinate(s_lat, s_lon):
+                points.append((at, s_lat, s_lon))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(points) < 3 or (now - points[-1][0]).total_seconds() > 180:
+        return {}
+
+    east_speeds, north_speeds = [], []
+    for old, new in zip(points[-3:-1], points[-2:]):
+        minutes = (new[0] - old[0]).total_seconds() / 60
+        if not 0.5 <= minutes <= MAX_SAMPLE_GAP_MINUTES:
+            continue
+        north_miles = (new[1] - old[1]) * 69.0
+        east_miles = (new[2] - old[2]) * 69.0 * math.cos(math.radians(lat))
+        mph = math.hypot(north_miles, east_miles) * 60 / minutes
+        if mph <= FORECAST_MAX_SPEED_MPH:
+            east_speeds.append(east_miles * 60 / minutes)
+            north_speeds.append(north_miles * 60 / minutes)
+    if len(east_speeds) < 2:
+        return {}
+
+    east_mph, north_mph = median(east_speeds), median(north_speeds)
+    if math.hypot(east_mph, north_mph) < 1.0:
+        return {}
+    forecasts = {}
+    for horizon in FORECAST_HORIZONS_MINUTES:
+        north = north_mph * horizon / 60
+        east = east_mph * horizon / 60
+        forecasts[str(horizon)] = {
+            "latitude": round(lat + north / 69.0, 6),
+            "longitude": round(lon + east / (69.0 * max(
+                0.2, abs(math.cos(math.radians(lat))))), 6),
+            "confidence": "medium" if horizon <= 3 else "low",
+            "method": "recent_gps_velocity",
+        }
+    return forecasts
+
+
+def update_forecast_accuracy(child_id, route, period, lat, lon, forecasts, now):
+    """Compare queued predictions with subsequent fresh locations and log error."""
+    try:
+        state = json.loads(FORECAST_STATE.read_text()) if FORECAST_STATE.exists() else {}
+        pending, keep = state.get("pending", []), []
+        for prediction in pending:
+            if (str(prediction.get("child_id")) != str(child_id)
+                    or prediction.get("stop_period") != period
+                    or str(prediction.get("route")) != str(route)):
+                keep.append(prediction)
+                continue
+            try:
+                issued = datetime.fromisoformat(prediction["issued_at"])
+                horizon = int(prediction["horizon_minutes"])
+                age = (now - (issued + timedelta(minutes=horizon))).total_seconds() / 60
+                if age > 3:
+                    continue
+                if age < 0:
+                    keep.append(prediction)
+                    continue
+                error = haversine_miles(
+                    prediction["latitude"], prediction["longitude"], lat, lon
+                )
+                log_event("position_forecast_scored", child_id=child_id,
+                          route=route, stop_period=period,
+                          horizon_minutes=horizon, error_miles=round(error, 3),
+                          issued_at=prediction["issued_at"],
+                          scored_at=now.isoformat(timespec="seconds"))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        last_issued = state.get("last_issued", {}).get(str(child_id))
+        can_issue = True
+        if last_issued:
+            try:
+                can_issue = now - datetime.fromisoformat(last_issued) >= timedelta(
+                    minutes=FORECAST_ISSUE_INTERVAL_MINUTES)
+            except ValueError:
+                pass
+        if forecasts and can_issue:
+            issued_at = now.isoformat(timespec="seconds")
+            for horizon, point in forecasts.items():
+                keep.append({"child_id": child_id, "route": route,
+                    "stop_period": period, "horizon_minutes": int(horizon),
+                    "latitude": point["latitude"], "longitude": point["longitude"],
+                    "issued_at": issued_at})
+            state.setdefault("last_issued", {})[str(child_id)] = issued_at
+        state["pending"] = keep[-500:]
+        write_private_json(FORECAST_STATE, state)
+    except Exception as exc:
+        log_event("forecast_scoring_failed", child_id=child_id,
+                  error_type=type(exc).__name__)
+
+
+def forecast_error_summary():
+    """Return anonymous aggregate forecast errors from the retained month."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=DIAGNOSTIC_RETENTION_DAYS)
+    errors = {h: [] for h in FORECAST_HORIZONS_MINUTES}
+    try:
+        paths = DIAGNOSTICS_DIR.glob("*.jsonl")
+        for path in paths:
+            try:
+                day = datetime.strptime(path.stem, "%Y-%m-%d").date()
+                if day < cutoff.astimezone(LOCAL_TIMEZONE).date():
+                    continue
+                with path.open() as stream:
+                    for line in stream:
+                        try:
+                            row = json.loads(line)
+                            if row.get("event") != "position_forecast_scored":
+                                continue
+                            horizon = int(row["horizon_minutes"])
+                            error = float(row["error_miles"])
+                            if horizon in errors and math.isfinite(error):
+                                errors[horizon].append(error)
+                        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                            continue
+            except OSError:
+                continue
+    except OSError:
+        pass
+    summary = {}
+    for horizon, values in errors.items():
+        if values:
+            ordered = sorted(values)
+            summary[str(horizon)] = {
+                "sample_count": len(values),
+                "median_error_miles": round(median(values), 3),
+                "p90_error_miles": round(ordered[min(len(ordered)-1,
+                    int(len(ordered) * 0.9))], 3),
+            }
+    return summary
+
+
+def ollama_analysis_worker():
+    """Summarize anonymized forecast scoring; never controls sensor output."""
+    try:
+        config = json.loads(OLLAMA_CONFIG.read_text())
+        interval = max(1, min(168, int(config.get("analysis_interval_hours", 24))))
+        base_url = str(config.get("base_url", "")).rstrip("/")
+        model = str(config.get("analysis_model", "Gpt-oss:20b"))
+        write_private_json(OLLAMA_STATE, {
+            "last_attempt_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "retry_after_hours": 6,
+        })
+        if urlsplit(base_url).scheme not in ("http", "https") or not urlsplit(base_url).hostname:
+            raise ValueError("Ollama base_url must be an http(s) URL")
+        summary = forecast_error_summary()
+        count = sum(x["sample_count"] for x in summary.values())
+        if count < 10:
+            log_event("ollama_analysis_skipped", reason="need_more_scored_forecasts",
+                      sample_count=count)
+            return
+        prompt = (
+            "Review these aggregate bus position forecast errors. They contain no "
+            "names, coordinates, addresses, or credentials. Identify only "
+            "evidence-supported patterns and conservative suggestions for future "
+            "evaluation. Do not invent data or recommend changing live predictions "
+            "without more evidence. Return JSON with keys observations (array of "
+            "strings), suggestions (array of strings), and data_limits (array of strings).\n"
+            + json.dumps(summary, separators=(",", ":"))
+        )
+        payload = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0},
+        }).encode()
+        req = Request(base_url + "/api/chat", data=payload,
+                      headers={"Content-Type": "application/json"}, method="POST")
+        with urlopen(req, timeout=120) as response:
+            result = json.load(response)
+        content = result.get("message", {}).get("content", "")
+        analysis = json.loads(content)
+        now = datetime.now(timezone.utc)
+        OLLAMA_ANALYSIS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_private_json(OLLAMA_ANALYSIS_DIR / "latest.json", {
+            "analyzed_at": now.isoformat(timespec="seconds"),
+            "model": model,
+            "lookback_days": DIAGNOSTIC_RETENTION_DAYS,
+            "forecast_error_summary": summary,
+            "analysis": analysis,
+        })
+        write_private_json(OLLAMA_STATE, {
+            "last_attempt_at": now.isoformat(timespec="seconds"),
+            "retry_after_hours": interval,
+        })
+        log_event("ollama_analysis_completed", model=model, scored_count=count)
+    except Exception as exc:
+        log_event("ollama_analysis_failed", error_type=type(exc).__name__)
+    finally:
+        try:
+            OLLAMA_LOCK.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def schedule_ollama_analysis():
+    """Launch the optional Ollama review out of band so polling stays quick."""
+    if not OLLAMA_CONFIG.exists():
+        return
+    try:
+        config = json.loads(OLLAMA_CONFIG.read_text())
+        state = json.loads(OLLAMA_STATE.read_text())
+        retry_hours = max(1, min(168, int(state.get("retry_after_hours", 6))))
+        last_attempt = datetime.fromisoformat(state["last_attempt_at"])
+        if datetime.now(timezone.utc) - last_attempt < timedelta(hours=retry_hours):
+            return
+    except FileNotFoundError:
+        try:
+            report = json.loads((OLLAMA_ANALYSIS_DIR / "latest.json").read_text())
+            last_run = datetime.fromisoformat(report["analyzed_at"])
+            interval = max(1, min(168, int(config.get("analysis_interval_hours", 24))))
+            if datetime.now(timezone.utc) - last_run < timedelta(hours=interval):
+                return
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError):
+            pass
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    try:
+        if OLLAMA_LOCK.exists():
+            if datetime.now(timezone.utc).timestamp() - OLLAMA_LOCK.stat().st_mtime < 7200:
+                return
+            OLLAMA_LOCK.unlink(missing_ok=True)
+        fd = os.open(OLLAMA_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--ollama-analysis-worker"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+        )
+    except FileExistsError:
+        return
+    except Exception as exc:
+        try:
+            OLLAMA_LOCK.unlink(missing_ok=True)
+        except OSError:
+            pass
+        log_event("ollama_worker_start_failed", error_type=type(exc).__name__)
 
 
 def valid_stop(lat, lon):
@@ -579,6 +835,14 @@ def read_buses(cache, tracking_state, historical_profiles):
                 })
             samples = samples[-6:]
 
+        position_forecasts = (
+            predict_positions(samples, lat, lon, now) if gps_fresh else {}
+        )
+        if gps_fresh:
+            update_forecast_accuracy(
+                child_id, route, period, lat, lon, position_forecasts, now
+            )
+
         was_near = previous.get("near_stop_at")
         near_now = gps_fresh and stop_distance is not None and stop_distance <= NEAR_STOP_MILES
         if near_now and period == "pm":
@@ -678,6 +942,8 @@ def read_buses(cache, tracking_state, historical_profiles):
             "eta_reason": eta_reason,
             "location_age_minutes": round(age, 1) if age is not None else None,
             "location_fresh": bool(gps_fresh),
+            # Predicted coordinates are explicitly separated from observed GPS.
+            "position_forecasts": position_forecasts,
             "stop_period": stop["stop_period"],
             "stop_id": stop["stop_id"],
             "stop_time": stop["stop_time"],
@@ -704,6 +970,7 @@ def read_buses(cache, tracking_state, historical_profiles):
             bus_longitude=lon if gps_valid else None,
             location_age_minutes=bus_record["location_age_minutes"],
             location_fresh=bool(gps_fresh),
+            position_forecasts=position_forecasts,
             stop_period=period,
             stop_source=stop["stop_source"],
             stop_id=stop["stop_id"],
@@ -801,6 +1068,7 @@ def main():
             elapsed = round((datetime.now(timezone.utc) - started).total_seconds(), 2)
             log_event("run_completed", state="online", child_count=len(buses),
                       history_rows_written=history_rows, elapsed_seconds=elapsed)
+            schedule_ollama_analysis()
             print(json.dumps(
                 {"state": "online", "buses": buses},
                 separators=(",", ":"),
@@ -816,6 +1084,10 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--ollama-analysis-worker" in sys.argv[1:]:
+        RUN_ID = "ollama-analysis"
+        ollama_analysis_worker()
+        sys.exit(0)
     try:
         main()
     except Exception as exc:
