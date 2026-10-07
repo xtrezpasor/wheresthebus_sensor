@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Last updated: 2026-10-07 02:59 PM EDT (America/New_York)
+# Last updated: 2026-10-07 04:44 PM EDT (America/New_York)
 """Read WheresTheBus data for a Home Assistant command_line sensor.
 
 Adds AM/PM stop information and a conservative GPS-movement ETA fallback.
