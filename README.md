@@ -2,6 +2,10 @@
 
 A Python command-line sensor backend for Home Assistant. It fetches rider and stop data, keeps the vendor ETA for comparison, estimates arrival from repeated fresh GPS readings, and writes local CSV history and JSONL diagnostics under `/config`.
 
+The backup ETA now also learns a per-rider, per-route, time-of-day speed baseline from up to 30 days of prior diagnostic logs. It uses that baseline only when the current GPS location is fresh and at least one recent live sample confirms the bus is moving toward the stop, but there are not yet enough samples for a live ETA. A one-day baseline is marked low confidence; more days improve confidence. The private speed cache is refreshed every six hours. Ollama is not required for the ETA calculation.
+
+Daily diagnostic JSONL files and CSV history are automatically removed when they are older than 30 days or belong to a completed weekend. The current day's file is kept until the next day, so the cleanup does not erase diagnostics while the day is still active.
+
 ## Private local configuration
 
 Keep `/config/wtb_credentials.json` on Home Assistant only. It contains the WheresTheBus login and may optionally contain your local rider-name mapping. Do not commit it to GitHub. Example structure (replace the placeholders locally):
@@ -26,7 +30,9 @@ Place `wheresthebus_sensor.py` at `/config/wheresthebus_sensor.py`. Keep the exi
 docker exec homeassistant python /config/wheresthebus_sensor.py --now
 ```
 
-The command should print one JSON object containing `state` and `buses`. Daily diagnostics are written under `/config/wtb_history/diagnostics/` and retained for 30 days.
+The command should print one JSON object containing `state` and `buses`. Daily diagnostics are written under `/config/wtb_history/diagnostics/`; diagnostic and CSV history files are pruned after 30 days and past weekend logs are removed.
+
+The ETA fallback requires fresh vendor GPS data and a valid stop coordinate. More frequent Home Assistant polling cannot make the bus's GPS update more frequently. The supplied diagnostic logs show the sensor running about every 30 seconds, so increasing its polling rate is unlikely to fix missing arrival notifications and may add unnecessary API requests. Arrival and error push notifications are sent by Home Assistant automations, not directly by this Python script.
 
 ## Alert when the sensor has an error
 
