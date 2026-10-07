@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Last updated: 2026-10-07 05:08 PM EDT (America/New_York)
+# Last updated: 2026-10-07 05:09 PM EDT (America/New_York)
 """Read WheresTheBus data for a Home Assistant command_line sensor.
 
 Adds AM/PM stop information and a conservative GPS-movement ETA fallback.
@@ -271,12 +271,12 @@ def haversine_miles(lat1, lon1, lat2, lon2):
     return 2 * radius_miles * math.asin(min(1.0, math.sqrt(a)))
 
 
-def predict_positions(samples, lat, lon, now):
+def predict_positions(samples, lat, lon, now, location_age_minutes=0):
     """Extrapolate short-horizon positions from recent measured GPS motion."""
     points = []
     for sample in samples[-5:]:
         try:
-            at = datetime.fromisoformat(sample["at"])
+            at = datetime.fromisoformat(sample.get("gps_at", sample["at"]))
             s_lat, s_lon = float(sample["lat"]), float(sample["lon"])
             if valid_coordinate(s_lat, s_lon):
                 points.append((at, s_lat, s_lon))
@@ -304,8 +304,11 @@ def predict_positions(samples, lat, lon, now):
         return {}
     forecasts = {}
     for horizon in FORECAST_HORIZONS_MINUTES:
-        north = north_mph * horizon / 60
-        east = east_mph * horizon / 60
+        # API coordinates may already be a minute or two old; project from
+        # their estimated observation time through now and the requested horizon.
+        projected_minutes = horizon + max(0.0, float(location_age_minutes or 0))
+        north = north_mph * projected_minutes / 60
+        east = east_mph * projected_minutes / 60
         forecasts[str(horizon)] = {
             "latitude": round(lat + north / 69.0, 6),
             "longitude": round(lon + east / (69.0 * max(
@@ -316,7 +319,8 @@ def predict_positions(samples, lat, lon, now):
     return forecasts
 
 
-def update_forecast_accuracy(child_id, route, period, lat, lon, forecasts, now):
+def update_forecast_accuracy(child_id, route, period, lat, lon, forecasts, now,
+                             location_age_minutes=0):
     """Compare queued predictions with subsequent fresh locations and log error."""
     try:
         state = json.loads(FORECAST_STATE.read_text()) if FORECAST_STATE.exists() else {}
@@ -330,8 +334,9 @@ def update_forecast_accuracy(child_id, route, period, lat, lon, forecasts, now):
             try:
                 issued = datetime.fromisoformat(prediction["issued_at"])
                 horizon = int(prediction["horizon_minutes"])
-                age = (now - (issued + timedelta(minutes=horizon))).total_seconds() / 60
-                if age > 3:
+                actual_at = now - timedelta(minutes=max(0.0, float(location_age_minutes or 0)))
+                age = (actual_at - (issued + timedelta(minutes=horizon))).total_seconds() / 60
+                if age > 2.5:
                     continue
                 if age < 0:
                     keep.append(prediction)
@@ -342,6 +347,8 @@ def update_forecast_accuracy(child_id, route, period, lat, lon, forecasts, now):
                 log_event("position_forecast_scored", child_id=child_id,
                           route=route, stop_period=period,
                           horizon_minutes=horizon, error_miles=round(error, 3),
+                          actual_location_age_minutes=round(
+                              max(0.0, float(location_age_minutes or 0)), 2),
                           issued_at=prediction["issued_at"],
                           scored_at=now.isoformat(timespec="seconds"))
             except (KeyError, TypeError, ValueError):
@@ -829,6 +836,9 @@ def read_buses(cache, tracking_state, historical_profiles):
             ):
                 samples.append({
                     "at": now.isoformat(timespec="seconds"),
+                    # Keep measured GPS time distinct from the API poll time.
+                    "gps_at": (now - timedelta(minutes=max(0.0, age or 0))).isoformat(
+                        timespec="seconds"),
                     "distance": stop_distance,
                     "lat": lat,
                     "lon": lon,
@@ -836,11 +846,11 @@ def read_buses(cache, tracking_state, historical_profiles):
             samples = samples[-6:]
 
         position_forecasts = (
-            predict_positions(samples, lat, lon, now) if gps_fresh else {}
+            predict_positions(samples, lat, lon, now, age) if gps_fresh else {}
         )
         if gps_fresh:
             update_forecast_accuracy(
-                child_id, route, period, lat, lon, position_forecasts, now
+                child_id, route, period, lat, lon, position_forecasts, now, age
             )
 
         was_near = previous.get("near_stop_at")
