@@ -4,6 +4,20 @@ A Python command-line sensor backend for Home Assistant. It fetches rider and st
 
 The backup ETA now also learns a per-rider, per-route, time-of-day speed baseline from up to 30 days of prior diagnostic logs. It uses that baseline only when the current GPS location is fresh and at least one recent live sample confirms the bus is moving toward the stop, but there are not yet enough samples for a live ETA. A one-day baseline is marked low confidence; more days improve confidence. The private speed cache is refreshed every six hours. Ollama is not required for the ETA calculation.
 
+When the bus has at least three distinct fresh GPS positions and recent motion is plausible, the sensor exposes `position_forecasts` for 1, 3, 5, and 10 minutes. These are straight-line velocity projections, clearly separate from observed `latitude` and `longitude`; 5- and 10-minute projections are marked low confidence because road turns and stops are unknown. The sensor records forecasts locally and later compares them with fresh bus GPS, writing `position_forecast_scored` diagnostics with the error in miles.
+
+Optional Ollama review runs at most once per configured interval in a background process. It sends only the anonymized aggregate error counts and median/90th-percentile errors for each horizon to `/api/chat`; it does not send GPS coordinates, stop addresses, rider names, credentials, or route IDs. Its suggestions are saved under `/config/wtb_history/ollama_analysis/latest.json` and never change live forecasts. Add `/config/wtb_ollama.json` with this private configuration:
+
+```json
+{
+  "base_url": "http://YOUR_OLLAMA_HOST:11434",
+  "analysis_model": "Gpt-oss:20b",
+  "analysis_interval_hours": 24
+}
+```
+
+Use a LAN address that Home Assistant can reach, and make sure Ollama listens on the LAN interface. If this file is absent, Ollama is not contacted. `qwen3-embedding:4b` is not used for coordinate prediction: embedding models represent semantic similarity, while bus movement is evaluated from numeric GPS trajectories.
+
 Daily diagnostic JSONL files and CSV history are automatically removed when they are older than 30 days or belong to a completed weekend. The current day's file is kept until the next day, so the cleanup does not erase diagnostics while the day is still active.
 
 ## Private local configuration
