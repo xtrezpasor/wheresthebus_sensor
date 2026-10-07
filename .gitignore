@@ -3,6 +3,10 @@ wtb_credentials.json
 wtb_session.json
 wtb_history_state.json
 wtb_tracking_state.json
+wtb_eta_speed_cache.json
+wtb_forecast_state.json
+wtb_ollama.json
+wtb_ollama_analysis_state.json
 wtb_history/
 __pycache__/
 *.py[cod]
