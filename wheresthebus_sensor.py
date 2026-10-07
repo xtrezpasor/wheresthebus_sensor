@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Last updated: 2026-09-30 04:00:50 PM EDT (America/New_York)
+# Last updated: 2026-10-07 02:59 PM EDT (America/New_York)
 """Read WheresTheBus data for a Home Assistant command_line sensor.
 
 Adds AM/PM stop information and a conservative GPS-movement ETA fallback.
@@ -33,6 +33,7 @@ CACHE = Path("/config/wtb_session.json")
 HISTORY_DIR = Path("/config/wtb_history")
 HISTORY_STATE = Path("/config/wtb_history_state.json")
 TRACKING_STATE = Path("/config/wtb_tracking_state.json")
+ETA_SPEED_CACHE = Path("/config/wtb_eta_speed_cache.json")
 DIAGNOSTICS_DIR = HISTORY_DIR / "diagnostics"
 LOCAL_TIMEZONE = ZoneInfo("America/New_York")
 
@@ -57,6 +58,10 @@ MAX_LOCATION_AGE_MINUTES = 3
 MAX_SAMPLE_GAP_MINUTES = 8
 MAX_ETA_MINUTES = 180
 DIAGNOSTIC_RETENTION_DAYS = 30
+HISTORICAL_ETA_LOOKBACK_DAYS = 30
+HISTORICAL_ETA_CACHE_HOURS = 6
+HISTORICAL_ETA_MIN_SAMPLES = 10
+HISTORICAL_ETA_MIN_DAYS = 1
 RUN_ID = "startup"
 
 
@@ -88,17 +93,34 @@ def log_event(event, **fields):
 
 
 def prune_diagnostic_logs():
-    """Keep daily diagnostics for a month, then remove older logs."""
-    cutoff = datetime.now(LOCAL_TIMEZONE).date() - timedelta(days=DIAGNOSTIC_RETENTION_DAYS)
-    try:
-        for path in DIAGNOSTICS_DIR.glob("*.jsonl"):
-            try:
-                if datetime.strptime(path.stem, "%Y-%m-%d").date() < cutoff:
-                    path.unlink()
-            except ValueError:
-                continue
-    except OSError:
-        pass
+    """Remove past weekend logs and logs older than the retention window."""
+    today = datetime.now(LOCAL_TIMEZONE).date()
+    cutoff = today - timedelta(days=DIAGNOSTIC_RETENTION_DAYS)
+    removed = 0
+    # These directories contain dated daily files only. Keep today's file,
+    # including on weekends, so an active day's diagnostics remain available.
+    for directory, pattern in ((DIAGNOSTICS_DIR, "*.jsonl"), (HISTORY_DIR, "*.csv")):
+        try:
+            paths = directory.glob(pattern)
+            for path in paths:
+                try:
+                    log_day = datetime.strptime(path.stem, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                expired = log_day < cutoff
+                past_weekend = log_day < today and log_day.weekday() >= 5
+                if expired or past_weekend:
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    if removed:
+        log_event("history_logs_pruned", removed_file_count=removed,
+                  retention_days=DIAGNOSTIC_RETENTION_DAYS,
+                  weekend_logs_removed=True)
 
 
 def request(url, body):
@@ -333,7 +355,130 @@ def estimate_eta_from_history(samples, current_distance, now):
     return None, "calculated_eta_out_of_range", round(mph, 2), len(closing_rates)
 
 
-def read_buses(cache, tracking_state):
+def distance_band(distance):
+    """Group prior bus speeds by approximate distance from this stop."""
+    if distance <= 0.5:
+        return "0-0.5"
+    if distance <= 1.5:
+        return "0.5-1.5"
+    if distance <= 3.0:
+        return "1.5-3"
+    return "3+"
+
+
+def load_historical_speed_profiles(now):
+    """Learn conservative per-rider speeds from prior days' private diagnostics.
+
+    Only adjacent fresh GPS observations from the same service day, route,
+    rider, and stop period are used. Today's data is excluded so this is a
+    genuine prior-days baseline, not a second copy of the live estimate.
+    """
+    try:
+        if ETA_SPEED_CACHE.exists():
+            cached = json.loads(ETA_SPEED_CACHE.read_text())
+            built_at = datetime.fromisoformat(cached.get("built_at", ""))
+            if now - built_at < timedelta(hours=HISTORICAL_ETA_CACHE_HOURS):
+                return cached.get("profiles", {})
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+
+    today = now.astimezone(LOCAL_TIMEZONE).date()
+    cutoff = today - timedelta(days=HISTORICAL_ETA_LOOKBACK_DAYS)
+    # Keep speed observations grouped by rider, route, period, distance band,
+    # and service day. Requiring multiple days avoids trusting one unusual trip.
+    speeds = {}
+    previous = {}
+    try:
+        paths = sorted(DIAGNOSTICS_DIR.glob("*.jsonl"))
+    except OSError:
+        paths = []
+
+    for path in paths:
+        try:
+            service_day = datetime.strptime(path.stem, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if service_day < cutoff or service_day >= today:
+            continue
+        try:
+            with path.open() as stream:
+                for line in stream:
+                    try:
+                        row = json.loads(line)
+                        if row.get("event") != "child_assessment":
+                            continue
+                        if not row.get("location_fresh"):
+                            continue
+                        distance = number(row.get("stop_distance_miles"))
+                        child_id = str(row.get("child_id") or "")
+                        route = str(row.get("route") or "")
+                        period = str(row.get("stop_period") or "")
+                        observed = datetime.fromisoformat(row.get("at_utc", ""))
+                        if (distance is None or not child_id or not route
+                                or period not in ("am", "pm")):
+                            continue
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        continue
+
+                    key = (child_id, route, period, service_day.isoformat())
+                    old = previous.get(key)
+                    if old:
+                        elapsed = (observed - old[0]).total_seconds() / 60.0
+                        closing = old[1] - distance
+                        if 0.5 <= elapsed <= MAX_SAMPLE_GAP_MINUTES and closing >= 0.015:
+                            mph = closing * 60.0 / elapsed
+                            if 2.0 <= mph <= 55.0:
+                                band = distance_band((old[1] + distance) / 2.0)
+                                profile_key = "|".join((child_id, route, period, band))
+                                entry = speeds.setdefault(profile_key, {})
+                                entry.setdefault(service_day.isoformat(), []).append(mph)
+                    previous[key] = (observed, distance)
+        except OSError:
+            continue
+
+    profiles = {}
+    for key, by_day in speeds.items():
+        observations = [speed for daily in by_day.values() for speed in daily]
+        if (len(observations) >= HISTORICAL_ETA_MIN_SAMPLES
+                and len(by_day) >= HISTORICAL_ETA_MIN_DAYS):
+            profiles[key] = {
+                "median_mph": round(median(observations), 2),
+                "sample_count": len(observations),
+                "day_count": len(by_day),
+                "confidence": "medium" if len(by_day) >= 3 else "low",
+            }
+
+    try:
+        write_private_json(ETA_SPEED_CACHE, {
+            "built_at": now.isoformat(timespec="seconds"),
+            "profiles": profiles,
+        })
+    except OSError:
+        pass
+    log_event("historical_eta_profiles_loaded", profile_count=len(profiles),
+              lookback_days=HISTORICAL_ETA_LOOKBACK_DAYS)
+    return profiles
+
+
+def estimate_eta_from_prior_days(profiles, child_id, route, period, distance):
+    """Use a multi-day median speed only when live GPS is fresh."""
+    if distance is None or distance <= NEAR_STOP_MILES:
+        return None, None
+    key = "|".join((str(child_id), str(route or ""), period, distance_band(distance)))
+    profile = profiles.get(key)
+    if not profile:
+        return None, None
+    try:
+        mph = float(profile["median_mph"])
+        eta = int(round(distance / mph * 60.0))
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None, None
+    if 0 <= eta <= MAX_ETA_MINUTES:
+        return eta, profile
+    return None, None
+
+
+def read_buses(cache, tracking_state, historical_profiles):
     session = cache["session_id"]
     base = cache["base"]
     user = api(
@@ -403,6 +548,21 @@ def read_buses(cache, tracking_state):
         backup_eta, eta_reason, closing_speed, closing_intervals = estimate_eta_from_history(
             samples, stop_distance, now
         )
+        eta_source = "gps_movement" if backup_eta is not None else "unavailable"
+        eta_confidence = "medium" if backup_eta is not None else "unavailable"
+        historical_profile = None
+        # If fresh live GPS has at least one recent closing interval but not
+        # enough intervals for a live ETA, use this rider's prior-trip speed.
+        # Never use old-day speeds when today's bus location is stale or not
+        # currently moving toward the stop.
+        if backup_eta is None and gps_fresh and closing_intervals >= 1:
+            backup_eta, historical_profile = estimate_eta_from_prior_days(
+                historical_profiles, child_id, route, period, stop_distance
+            )
+            if backup_eta is not None:
+                eta_source = "historical_speed"
+                eta_confidence = historical_profile.get("confidence", "low")
+                eta_reason = "prior_days_median_speed"
         if gps_fresh and stop_distance is not None:
             # Keep samples only from valid, fresh bus locations. Avoid storing
             # repeated identical coordinates, which create false zero speeds.
@@ -454,6 +614,8 @@ def read_buses(cache, tracking_state):
         # movement must not create another arrival or ETA for the same day.
         if dropped_off_likely:
             backup_eta = None
+            eta_source = "unavailable"
+            eta_confidence = "unavailable"
             eta_reason = "likely_dropoff_already_detected"
         new_track[track_key] = {
             "service_day": service_day,
@@ -511,7 +673,8 @@ def read_buses(cache, tracking_state):
             "app_eta_minutes": app_eta,
             # A backup ETA is only published from repeated, fresh GPS movement.
             "eta_minutes": backup_eta,
-            "eta_source": "gps_movement" if backup_eta is not None else "unavailable",
+            "eta_source": eta_source,
+            "eta_confidence": eta_confidence,
             "eta_reason": eta_reason,
             "location_age_minutes": round(age, 1) if age is not None else None,
             "location_fresh": bool(gps_fresh),
@@ -552,6 +715,9 @@ def read_buses(cache, tracking_state):
             closing_speed_mph=closing_speed,
             closing_intervals=closing_intervals,
             eta_minutes=backup_eta,
+            eta_source=eta_source,
+            eta_confidence=eta_confidence,
+            historical_speed_profile=historical_profile,
             eta_reason=eta_reason,
             arrival_likely=arrival_likely,
             arrival_reason=arrival_reason,
@@ -623,13 +789,14 @@ def main():
         }
     cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
     tracking_state = json.loads(TRACKING_STATE.read_text()) if TRACKING_STATE.exists() else {}
+    historical_profiles = load_historical_speed_profiles(started)
     for attempt in range(2):
         if not cache.get("session_id"):
             log_event("login_started", attempt=attempt + 1)
             cache = login(credentials, cache)
             log_event("login_succeeded", attempt=attempt + 1)
         try:
-            buses = read_buses(cache, tracking_state)
+            buses = read_buses(cache, tracking_state, historical_profiles)
             history_rows = record_history(buses, force="--now" in sys.argv[1:])
             elapsed = round((datetime.now(timezone.utc) - started).total_seconds(), 2)
             log_event("run_completed", state="online", child_count=len(buses),
