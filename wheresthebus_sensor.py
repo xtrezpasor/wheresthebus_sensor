@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Last updated: 2026-10-08 12:48 PM EDT (America/New_York)
+# Last updated: 2026-10-08 01:41 PM EDT (America/New_York)
 """Read WheresTheBus data for a Home Assistant command_line sensor.
 
 Adds AM/PM stop information and a conservative GPS-movement ETA fallback.
@@ -71,6 +71,7 @@ HISTORICAL_ETA_MIN_DAYS = 1
 FORECAST_HORIZONS_MINUTES = (1, 3, 5, 10)
 FORECAST_ISSUE_INTERVAL_MINUTES = 1
 FORECAST_MAX_SPEED_MPH = 55.0
+ARRIVAL_ALERT_THRESHOLDS_MILES = (1.0, 0.5, 0.2)
 RUN_ID = "startup"
 
 
@@ -939,6 +940,91 @@ def read_buses(cache, tracking_state, historical_profiles):
         if rider.get("isDistKm") in (1, True, "1") and app_distance is not None:
             app_distance *= 0.621371
 
+        # Track whether the value used by an HA alert appears to cross several
+        # distance thresholds in one sensor update. Record both vendor distance
+        # and GPS-to-stop distance so their behavior can be compared.
+        prior_watch = previous.get("alert_distance_watch", {})
+        alert_distance_watch = dict(prior_watch) if isinstance(prior_watch, dict) else {}
+        alert_threshold_events = []
+        distance_sources = {
+            "vendor_app_distance": app_distance,
+            "gps_stop_distance": stop_distance if gps_fresh else None,
+        }
+        for source, current_distance in distance_sources.items():
+            if current_distance is None:
+                continue
+            previous_entry = alert_distance_watch.get(source, {})
+            old_distance = number(previous_entry.get("distance")) if isinstance(
+                previous_entry, dict
+            ) else None
+            old_at = None
+            if isinstance(previous_entry, dict):
+                try:
+                    old_at = datetime.fromisoformat(previous_entry.get("observed_at", ""))
+                except (TypeError, ValueError):
+                    pass
+            gap_minutes = (
+                (now - old_at).total_seconds() / 60.0 if old_at else None
+            )
+            comparable = (
+                old_distance is not None and gap_minutes is not None
+                and 0 <= gap_minutes <= MAX_SAMPLE_GAP_MINUTES
+            )
+            if comparable:
+                crossed = [threshold for threshold in ARRIVAL_ALERT_THRESHOLDS_MILES
+                           if old_distance > threshold >= current_distance]
+                if crossed:
+                    event = {
+                        "source": source,
+                        "finding": "thresholds_crossed_in_current_update",
+                        "previous_distance_miles": round(old_distance, 3),
+                        "current_distance_miles": round(current_distance, 3),
+                        "crossed_thresholds_miles": crossed,
+                        "multiple_thresholds_same_update": len(crossed) > 1,
+                        "minutes_since_previous_sample": round(gap_minutes, 2),
+                    }
+                    alert_threshold_events.append(event)
+                    log_event("alert_distance_thresholds_crossed",
+                              child_id=child_id,
+                              child_name=CHILD_NAMES.get(child_id, "Unknown"),
+                              bus=child.get("busNo"), route=route,
+                              stop_period=period, status=status,
+                              location_fresh=bool(gps_fresh),
+                              location_age_minutes=round(age, 1) if age is not None else None,
+                              **event)
+            else:
+                already_within = [threshold for threshold in ARRIVAL_ALERT_THRESHOLDS_MILES
+                                  if current_distance <= threshold]
+                if already_within:
+                    event_name = (
+                        "thresholds_first_seen_below_after_gap" if old_distance is not None
+                        else "thresholds_already_met_at_first_observation"
+                    )
+                    event = {
+                        "source": source,
+                        "finding": event_name,
+                        "previous_distance_miles": round(old_distance, 3)
+                        if old_distance is not None else None,
+                        "current_distance_miles": round(current_distance, 3),
+                        "thresholds_already_met_miles": already_within,
+                        "minutes_since_previous_sample": round(gap_minutes, 2)
+                        if gap_minutes is not None else None,
+                    }
+                    alert_threshold_events.append(event)
+                    log_event("alert_distance_thresholds_first_seen_below",
+                              child_id=child_id,
+                              child_name=CHILD_NAMES.get(child_id, "Unknown"),
+                              bus=child.get("busNo"), route=route,
+                              stop_period=period, status=status,
+                              location_fresh=bool(gps_fresh),
+                              location_age_minutes=round(age, 1) if age is not None else None,
+                              **event)
+            alert_distance_watch[source] = {
+                "distance": current_distance,
+                "observed_at": now.isoformat(timespec="seconds"),
+            }
+        new_track[track_key]["alert_distance_watch"] = alert_distance_watch
+
         if stop["stop_latitude"] is None:
             arrival_reason = "selected_stop_unavailable"
         elif not gps_fresh:
@@ -1012,6 +1098,7 @@ def read_buses(cache, tracking_state, historical_profiles):
             # Predicted coordinates are explicitly separated from observed GPS.
             "position_forecasts": position_forecasts,
             "position_forecasts_calculated_by_ai": False,
+            "alert_threshold_events_this_update": alert_threshold_events,
             "stop_period": stop["stop_period"],
             "stop_id": stop["stop_id"],
             "stop_time": stop["stop_time"],
@@ -1042,6 +1129,7 @@ def read_buses(cache, tracking_state, historical_profiles):
             location_age_minutes=bus_record["location_age_minutes"],
             location_fresh=bool(gps_fresh),
             position_forecasts=position_forecasts,
+            alert_threshold_events_this_update=alert_threshold_events,
             stop_period=period,
             stop_source=stop["stop_source"],
             stop_id=stop["stop_id"],
