@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Last updated: 2026-10-07 05:09 PM EDT (America/New_York)
+# Last updated: 2026-10-08 12:48 PM EDT (America/New_York)
 """Read WheresTheBus data for a Home Assistant command_line sensor.
 
 Adds AM/PM stop information and a conservative GPS-movement ETA fallback.
@@ -315,6 +315,7 @@ def predict_positions(samples, lat, lon, now, location_age_minutes=0):
                 0.2, abs(math.cos(math.radians(lat))))), 6),
             "confidence": "medium" if horizon <= 3 else "low",
             "method": "recent_gps_velocity",
+            "calculated_by_ai": False,
         }
     return forecasts
 
@@ -523,6 +524,35 @@ def schedule_ollama_analysis():
         except OSError:
             pass
         log_event("ollama_worker_start_failed", error_type=type(exc).__name__)
+
+
+def load_ai_analysis():
+    """Expose the latest Ollama review with an explicit scope and provenance."""
+    try:
+        report = json.loads((OLLAMA_ANALYSIS_DIR / "latest.json").read_text())
+        return {
+            "status": "available",
+            "type": "forecast_accuracy_review",
+            "calculated_by_ai": True,
+            "model": report.get("model"),
+            "analyzed_at": report.get("analyzed_at"),
+            "applies_to_live_eta_or_position": False,
+            "result": report.get("analysis"),
+        }
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        try:
+            configured = OLLAMA_CONFIG.exists()
+        except OSError:
+            configured = False
+        return {
+            "status": "waiting_for_scored_forecasts" if configured else "not_configured",
+            "type": "forecast_accuracy_review",
+            "calculated_by_ai": False,
+            "model": None,
+            "analyzed_at": None,
+            "applies_to_live_eta_or_position": False,
+            "result": None,
+        }
 
 
 def valid_stop(lat, lon):
@@ -855,27 +885,32 @@ def read_buses(cache, tracking_state, historical_profiles):
 
         was_near = previous.get("near_stop_at")
         near_now = gps_fresh and stop_distance is not None and stop_distance <= NEAR_STOP_MILES
-        if near_now and period == "pm":
+        if near_now:
             near_at = now.isoformat(timespec="seconds")
         else:
             near_at = was_near
 
         dropoff_at = previous.get("dropoff_likely_at")
-        new_dropoff_detected = False
-        if period == "pm" and gps_fresh and stop_distance is not None and was_near:
+        past_stop_at = previous.get("past_stop_at") or dropoff_at
+        new_past_stop_detected = False
+        if gps_fresh and stop_distance is not None and was_near:
             try:
                 candidate_at = datetime.fromisoformat(was_near)
                 elapsed = now - candidate_at
-                new_dropoff_detected = (
+                new_past_stop_detected = (
                     timedelta(0) <= elapsed <= timedelta(minutes=20)
                     and stop_distance >= LEFT_STOP_MILES
                 )
             except (TypeError, ValueError):
                 pass
+        if new_past_stop_detected and not past_stop_at:
+            past_stop_at = now.isoformat(timespec="seconds")
+        new_dropoff_detected = bool(new_past_stop_detected and period == "pm")
         if new_dropoff_detected and not dropoff_at:
             dropoff_at = now.isoformat(timespec="seconds")
         dropped_off_likely = bool(dropoff_at)
-        if dropped_off_likely:
+        is_past_stop = bool(past_stop_at)
+        if is_past_stop:
             near_at = None
         elif near_at:
             try:
@@ -896,6 +931,7 @@ def read_buses(cache, tracking_state, historical_profiles):
             "samples": samples,
             "near_stop_at": near_at,
             "dropoff_likely_at": dropoff_at,
+            "past_stop_at": past_stop_at,
         }
         app_eta = parse_app_eta(rider.get("etaMsg"))
         app_distance = number(rider.get("dist"))
@@ -912,9 +948,23 @@ def read_buses(cache, tracking_state, historical_profiles):
         else:
             arrival_reason = "fresh_gps_outside_arrival_radius"
 
-        arrival_likely = bool(near_now and not dropped_off_likely)
-        if dropped_off_likely and not new_dropoff_detected:
-            arrival_reason = "likely_dropoff_already_detected_for_service_day"
+        is_at_stop = bool(near_now and not is_past_stop)
+        arrival_likely = is_at_stop
+        if is_past_stop:
+            arrival_reason = "stop_already_passed_for_service_day"
+
+        if is_past_stop:
+            past_stop_reason = (
+                "bus_departed_stop_after_recent_proximity"
+                if new_past_stop_detected
+                else "stop_already_marked_passed_for_service_day"
+            )
+        elif not gps_fresh:
+            past_stop_reason = "bus_location_stale_or_missing"
+        elif near_now:
+            past_stop_reason = "bus_at_stop_not_yet_seen_departing"
+        else:
+            past_stop_reason = "no_recent_stop_proximity_then_departure"
 
         if period != "pm":
             dropoff_reason = "not_pm_route_window"
@@ -950,10 +1000,18 @@ def read_buses(cache, tracking_state, historical_profiles):
             "eta_source": eta_source,
             "eta_confidence": eta_confidence,
             "eta_reason": eta_reason,
+            "eta_calculated_by_ai": False,
+            "eta_calculation_source": eta_source,
+            "eta_calculation_method": {
+                "gps_movement": "recent_fresh_gps_movement",
+                "historical_speed": "prior_days_gps_speed",
+                "unavailable": "not_calculated",
+            }.get(eta_source, "unknown"),
             "location_age_minutes": round(age, 1) if age is not None else None,
             "location_fresh": bool(gps_fresh),
             # Predicted coordinates are explicitly separated from observed GPS.
             "position_forecasts": position_forecasts,
+            "position_forecasts_calculated_by_ai": False,
             "stop_period": stop["stop_period"],
             "stop_id": stop["stop_id"],
             "stop_time": stop["stop_time"],
@@ -961,6 +1019,9 @@ def read_buses(cache, tracking_state, historical_profiles):
             "stop_longitude": stop["stop_longitude"],
             "stop_source": stop["stop_source"],
             "stop_distance_miles": stop_distance,
+            "is_at_stop": is_at_stop,
+            "is_past_stop": is_past_stop,
+            "past_stop_reason": past_stop_reason,
             "arrival_likely": arrival_likely,
             "arrival_reason": arrival_reason,
             "dropped_off_likely": bool(dropped_off_likely),
@@ -993,11 +1054,15 @@ def read_buses(cache, tracking_state, historical_profiles):
             closing_intervals=closing_intervals,
             eta_minutes=backup_eta,
             eta_source=eta_source,
+            eta_calculated_by_ai=False,
             eta_confidence=eta_confidence,
             historical_speed_profile=historical_profile,
             eta_reason=eta_reason,
             arrival_likely=arrival_likely,
             arrival_reason=arrival_reason,
+            is_at_stop=is_at_stop,
+            is_past_stop=is_past_stop,
+            past_stop_reason=past_stop_reason,
             dropped_off_likely=bool(dropped_off_likely),
             dropoff_reason=dropoff_reason,
         )
@@ -1074,13 +1139,16 @@ def main():
             log_event("login_succeeded", attempt=attempt + 1)
         try:
             buses = read_buses(cache, tracking_state, historical_profiles)
+            ai_analysis = load_ai_analysis()
+            for bus in buses:
+                bus["ai_analysis"] = ai_analysis
             history_rows = record_history(buses, force="--now" in sys.argv[1:])
             elapsed = round((datetime.now(timezone.utc) - started).total_seconds(), 2)
             log_event("run_completed", state="online", child_count=len(buses),
                       history_rows_written=history_rows, elapsed_seconds=elapsed)
             schedule_ollama_analysis()
             print(json.dumps(
-                {"state": "online", "buses": buses},
+                {"state": "online", "buses": buses, "ai_analysis": ai_analysis},
                 separators=(",", ":"),
             ))
             return
