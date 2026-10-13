@@ -772,6 +772,26 @@ def estimate_eta_from_prior_days(profiles, child_id, route, period, distance):
     return None, None
 
 
+def build_display_values(stop_status, app_eta_message, app_eta_minutes,
+                         backup_eta, eta_source, app_distance_miles):
+    """Return concise UI values while keeping raw vendor values separately."""
+    if stop_status == "passed_stop":
+        return "Passed stop", None, "stop_status"
+    if stop_status == "arrived":
+        return "Arrived at stop", None, "stop_status"
+    if backup_eta is not None:
+        label = "GPS estimate" if eta_source == "gps_movement" else "historical estimate"
+        return f"{backup_eta} min ({label})", app_distance_miles, eta_source
+    if app_eta_minutes is not None and 0 <= app_eta_minutes <= MAX_ETA_MINUTES:
+        return f"{app_eta_minutes} min (app)", app_distance_miles, "app"
+    if app_eta_minutes is not None:
+        return "No reliable ETA", app_distance_miles, "app_out_of_range"
+    raw_eta = str(app_eta_message or "").strip()
+    if raw_eta and raw_eta.casefold() not in {"no eta", "none", "null"}:
+        return f"App: {raw_eta}", app_distance_miles, "app_status"
+    return "No ETA", app_distance_miles, "unavailable"
+
+
 def read_buses(cache, tracking_state, historical_profiles):
     session = cache["session_id"]
     base = cache["base"]
@@ -886,6 +906,9 @@ def read_buses(cache, tracking_state, historical_profiles):
 
         was_near = previous.get("near_stop_at")
         near_now = gps_fresh and stop_distance is not None and stop_distance <= NEAR_STOP_MILES
+        arrival_at = previous.get("arrival_at")
+        if near_now and not arrival_at:
+            arrival_at = now.isoformat(timespec="seconds")
         if near_now:
             near_at = now.isoformat(timespec="seconds")
         else:
@@ -920,17 +943,19 @@ def read_buses(cache, tracking_state, historical_profiles):
             except (TypeError, ValueError):
                 near_at = None
 
-        # Once the bus has likely completed this rider's stop, later bus GPS
-        # movement must not create another arrival or ETA for the same day.
-        if dropped_off_likely:
+        # Once the bus has passed this rider's selected stop, later GPS or
+        # vendor updates must not create another ETA for the same service day.
+        # This applies to AM pickups as well as PM drop-offs.
+        if is_past_stop:
             backup_eta = None
             eta_source = "unavailable"
             eta_confidence = "unavailable"
-            eta_reason = "likely_dropoff_already_detected"
+            eta_reason = "stop_already_passed_for_service_day"
         new_track[track_key] = {
             "service_day": service_day,
             "samples": samples,
             "near_stop_at": near_at,
+            "arrival_at": arrival_at,
             "dropoff_likely_at": dropoff_at,
             "past_stop_at": past_stop_at,
         }
@@ -1069,21 +1094,38 @@ def read_buses(cache, tracking_state, historical_profiles):
         else:
             dropoff_reason = "no_recent_stop_proximity_sample"
 
+        stop_status = "passed_stop" if is_past_stop else (
+            "arrived" if arrival_at else "approaching"
+        )
+        display_eta, display_distance, display_eta_source = build_display_values(
+            stop_status, rider.get("etaMsg"), app_eta, backup_eta,
+            eta_source, app_distance,
+        )
+
         bus_record = {
             "child_id": child_id,
             "child_name": CHILD_NAMES.get(child_id, "Unknown"),
             "bus": child.get("busNo"),
             "route": route,
-            # Kept for compatibility with existing Home Assistant automations.
-            "eta": rider.get("etaMsg"),
+            # UI-facing fields show derived stop status and a labeled ETA.
+            "eta": display_eta,
             "status": status,
-            "distance": round(app_distance, 2) if app_distance is not None else None,
+            "distance": round(display_distance, 2)
+            if display_distance is not None else None,
+            # Preserve vendor fields for diagnostics and existing automations.
+            "app_eta_message": rider.get("etaMsg"),
+            "app_distance_miles": round(app_distance, 2)
+            if app_distance is not None else None,
             "latitude": lat if gps_valid else 0.0,
             "longitude": lon if gps_valid else 0.0,
             "app_eta_minutes": app_eta,
             # A backup ETA is only published from repeated, fresh GPS movement.
             "eta_minutes": backup_eta,
             "eta_source": eta_source,
+            "display_eta_source": display_eta_source,
+            "display_eta": display_eta,
+            "display_distance_miles": round(display_distance, 2)
+            if display_distance is not None else None,
             "eta_confidence": eta_confidence,
             "eta_reason": eta_reason,
             "eta_calculated_by_ai": False,
@@ -1107,7 +1149,11 @@ def read_buses(cache, tracking_state, historical_profiles):
             "stop_source": stop["stop_source"],
             "stop_distance_miles": stop_distance,
             "is_at_stop": is_at_stop,
+            "arrival_confirmed": bool(arrival_at),
+            "arrival_confirmed_at": arrival_at,
             "is_past_stop": is_past_stop,
+            "passed_stop_at": past_stop_at,
+            "stop_status": stop_status,
             "past_stop_reason": past_stop_reason,
             "arrival_likely": arrival_likely,
             "arrival_reason": arrival_reason,
@@ -1123,7 +1169,7 @@ def read_buses(cache, tracking_state, historical_profiles):
             route=route,
             status=status,
             app_eta=rider.get("etaMsg"),
-            app_distance_miles=bus_record["distance"],
+            app_distance_miles=bus_record["app_distance_miles"],
             bus_latitude=lat if gps_valid else None,
             bus_longitude=lon if gps_valid else None,
             location_age_minutes=bus_record["location_age_minutes"],
@@ -1168,6 +1214,11 @@ def record_history(buses, force=False):
     for bus in buses:
         child_id = str(bus["child_id"])
         values = {field: bus.get(field) for field in HISTORY_FIELDS}
+        # Keep CSV history focused on the original vendor feed. The entity's
+        # eta/distance keys are now display values and may be intentionally
+        # replaced or hidden after an arrival/passed-stop determination.
+        values["eta"] = bus.get("app_eta_message")
+        values["distance"] = bus.get("app_distance_miles")
         last = previous.get(child_id, {})
         try:
             last_logged = datetime.fromisoformat(last["observed_at"])
@@ -1196,8 +1247,8 @@ def record_history(buses, force=False):
         for bus in rows:
             writer.writerow([
                 observed_at, bus.get("child_id"), bus.get("child_name"),
-                bus.get("bus"), bus.get("route"), bus.get("distance"),
-                bus.get("eta"), bus.get("status"), bus.get("latitude"),
+                bus.get("bus"), bus.get("route"), bus.get("app_distance_miles"),
+                bus.get("app_eta_message"), bus.get("status"), bus.get("latitude"),
                 bus.get("longitude"),
             ])
     write_private_json(HISTORY_STATE, previous)
