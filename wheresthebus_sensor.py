@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Last updated: 2026-10-08 01:41 PM EDT (America/New_York)
+# Last updated: 2026-10-13 08:38 AM EDT (America/New_York)
 """Read WheresTheBus data for a Home Assistant command_line sensor.
 
 Adds AM/PM stop information and a conservative GPS-movement ETA fallback.
@@ -1107,12 +1107,11 @@ def read_buses(cache, tracking_state, historical_profiles):
             "child_name": CHILD_NAMES.get(child_id, "Unknown"),
             "bus": child.get("busNo"),
             "route": route,
-            # UI-facing fields show derived stop status and a labeled ETA.
-            "eta": display_eta,
+            # Preserve raw keys consumed by existing Home Assistant automations.
+            "eta": rider.get("etaMsg"),
             "status": status,
-            "distance": round(display_distance, 2)
-            if display_distance is not None else None,
-            # Preserve vendor fields for diagnostics and existing automations.
+            "distance": round(app_distance, 2) if app_distance is not None else None,
+            # Explicit raw aliases make the app feed easy to distinguish.
             "app_eta_message": rider.get("etaMsg"),
             "app_distance_miles": round(app_distance, 2)
             if app_distance is not None else None,
