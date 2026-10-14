@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Last updated: 2026-10-07 04:48 PM EDT (America/New_York)
-"""Safely download and install the public Where's the Bus sensor from GitHub."""
+# Last updated: 2026-10-14 07:46 AM EDT (America/New_York)
+"""Safely download and install the public Where's the Bus sensor and learner."""
 
 import os
 import shutil
@@ -8,46 +8,64 @@ import tempfile
 from pathlib import Path
 from urllib.request import urlopen
 
-SOURCE_URL = (
+BASE_URL = (
     "https://raw.githubusercontent.com/xtrezpasor/"
-    "wheresthebus_sensor/main/wheresthebus_sensor.py"
+    "wheresthebus_sensor/main/"
 )
-TARGET = Path("/config/wheresthebus_sensor.py")
-BACKUP = Path("/config/wheresthebus_sensor.py.bak")
+FILES = {
+    "wheresthebus_sensor.py": "if __name__ == \"__main__\":",
+    "wheresthebus_route_learner.py": "if __name__ == \"__main__\":",
+}
+CONFIG_DIR = Path("/config")
 
 
-def main():
-    print("Downloading the latest bus sensor from GitHub...")
-    with urlopen(SOURCE_URL, timeout=30) as response:
+def download_and_validate(filename, required_text):
+    url = BASE_URL + filename
+    with urlopen(url, timeout=30) as response:
         data = response.read()
-
     text = data.decode("utf-8")
-    compile(text, str(TARGET), "exec")
-
+    compile(text, str(CONFIG_DIR / filename), "exec")
     if "# Last updated:" not in text[:300]:
-        raise RuntimeError("Downloaded file is missing its update timestamp.")
-    if 'if __name__ == "__main__":' not in text:
-        raise RuntimeError("Downloaded file does not contain its main entry point.")
+        raise RuntimeError(f"{filename} is missing its update timestamp")
+    if required_text not in text:
+        raise RuntimeError(f"{filename} is missing its expected entry point")
+    return data, text
 
-    TARGET.parent.mkdir(parents=True, exist_ok=True)
-    if TARGET.exists():
-        shutil.copy2(TARGET, BACKUP)
-        print(f"Saved previous script as {BACKUP}")
 
+def atomic_install(target, data):
     fd, temporary_path = tempfile.mkstemp(
-        prefix=".wheresthebus-", suffix=".py", dir=TARGET.parent
+        prefix=f".{target.stem}-", suffix=".py", dir=target.parent
     )
     try:
         with os.fdopen(fd, "wb") as temporary_file:
             temporary_file.write(data)
-        os.replace(temporary_path, TARGET)
+        os.chmod(temporary_path, 0o644)
+        os.replace(temporary_path, target)
     finally:
         if os.path.exists(temporary_path):
             os.unlink(temporary_path)
 
-    first_lines = text.splitlines()[:2]
-    print(f"Installed and syntax-checked {TARGET} ({len(data)} bytes).")
-    print(first_lines[1])
+
+def main():
+    print("Downloading and validating the bus sensor and route learner...")
+    downloaded = {
+        name: download_and_validate(name, expected)
+        for name, expected in FILES.items()
+    }
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    targets = {name: CONFIG_DIR / name for name in FILES}
+    for target in targets.values():
+        if target.exists():
+            backup = target.with_suffix(target.suffix + ".bak")
+            shutil.copy2(target, backup)
+            print(f"Saved previous {target.name} as {backup.name}")
+
+    for name, target in targets.items():
+        data, text = downloaded[name]
+        atomic_install(target, data)
+        print(f"Installed and syntax-checked {target} ({len(data)} bytes).")
+        print(text.splitlines()[1])
 
 
 if __name__ == "__main__":
