@@ -1174,14 +1174,16 @@ def read_buses(cache, tracking_state, route_profiles):
         if is_past_stop:
             arrival_reason = "stop_already_passed_for_service_day"
 
-        vendor_eta_usable = app_eta is not None and 0 <= app_eta <= MAX_ETA_MINUTES
+        # Presence, not plausibility, decides priority: never substitute a
+        # historical prediction while the vendor is displaying any numeric ETA.
+        vendor_eta_shown = app_eta is not None
         route_prediction = None
         moving_toward_stop = bool(
             gps_fresh and status == "current" and not is_past_stop
             and not near_now and stop_distance is not None
             and closing_intervals >= 2
         )
-        if (not vendor_eta_usable and moving_toward_stop):
+        if (not vendor_eta_shown and moving_toward_stop):
             route_prediction = estimate_eta_from_route_model(
                 route_profiles, child_id, route, period, lat, lon
             )
@@ -1193,14 +1195,14 @@ def read_buses(cache, tracking_state, route_profiles):
             and route_prediction.get("eta_max_minutes", MAX_ETA_MINUTES)
                 - route_prediction.get("eta_min_minutes", 0) <= 5
         )
-        if (not vendor_eta_usable and moving_toward_stop
+        if (not vendor_eta_shown and moving_toward_stop
                 and route_prediction_confident
                 and route_prediction.get("eta_minutes") is not None):
             backup_eta = route_prediction["eta_minutes"]
             eta_source = "historical_route_match"
             eta_confidence = route_prediction["confidence"]
             eta_reason = "moving_on_recurrent_learned_route"
-        elif vendor_eta_usable:
+        elif vendor_eta_shown:
             eta_reason = "vendor_eta_available_fallback_suppressed"
         elif not gps_fresh:
             eta_reason = "gps_location_stale_or_missing"
