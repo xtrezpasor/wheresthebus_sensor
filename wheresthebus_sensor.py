@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# Last updated: 2026-10-14 07:46 AM EDT (America/New_York)
+# Last updated: 2026-10-14 01:20 PM EDT (America/New_York)
 """Read WheresTheBus data for a Home Assistant command_line sensor.
 
-Adds AM/PM stop information, conservative GPS ETA fallbacks, and a historical
-route matcher backed by the separate daily route learner. The vendor ETA is
-retained as app_eta_minutes for comparison.
+Adds AM/PM stop information and a strict learned-route ETA fallback. The vendor
+ETA always takes priority; fallback estimates require fresh GPS, two intervals
+of movement toward the stop, and a narrow match to at least three learned trips.
 
 Credentials: /config/wtb_credentials.json
 Session cache: /config/wtb_session.json
@@ -61,8 +61,8 @@ HISTORY_COLUMNS = (
     "distance_miles", "eta", "status", "latitude", "longitude",
 )
 
-# Geometry and ETA guardrails. Distance-to-stop uses straight-line GPS
-# distance; ETA is only published after several fresh samples show closing.
+# Geometry and ETA guardrails. Predictive ETAs only use a learned route path;
+# straight-line and generic historical-speed estimates are diagnostic only.
 NEAR_STOP_MILES = 0.07
 LEFT_STOP_MILES = 0.12
 MAX_LOCATION_AGE_MINUTES = 3
@@ -795,7 +795,7 @@ def estimate_eta_from_route_model(profiles, child_id, route, period, lat, lon):
     """Match fresh GPS to completed prior trips and estimate time to the stop.
 
     This is a numeric historical-route estimate, not an Ollama-generated ETA.
-    It requires a close position match on at least two distinct school days.
+    It requires a very close position match on at least three distinct days.
     """
     key = "|".join((str(child_id), str(route or ""), str(period)))
     profile = profiles.get(key, {})
@@ -817,12 +817,12 @@ def estimate_eta_from_route_model(profiles, child_id, route, period, lat, lon):
                     best = (gap, remaining)
             except (KeyError, TypeError, ValueError):
                 continue
-        if best and best[0] <= 0.10:
+        if best and best[0] <= 0.05:
             used_days.add(day)
             matches.append({"day": day, "distance_miles": best[0],
                             "minutes": best[1]})
 
-    if len(matches) < 2:
+    if len(matches) < 3:
         return None
     estimates = [item["minutes"] for item in matches]
     eta = int(round(median(estimates)))
@@ -852,6 +852,18 @@ def estimate_eta_from_route_model(profiles, child_id, route, period, lat, lon):
         "calculated_by_ai": False,
         "source": "historical_route_match",
     }
+
+
+def learned_school_origin(profiles, child_id, route, period):
+    """Return a recurrent learned school waiting/departure area, if available."""
+    key = "|".join((str(child_id), str(route or ""), str(period)))
+    origin = profiles.get(key, {}).get("school_origin")
+    if not isinstance(origin, dict) or origin.get("days_seen", 0) < 3:
+        return None
+    try:
+        return float(origin["latitude"]), float(origin["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def schedule_route_learning():
@@ -892,7 +904,7 @@ def schedule_route_learning():
         log_event("route_learning_start_failed", error_type=type(exc).__name__)
 
 
-def read_buses(cache, tracking_state, historical_profiles, route_profiles):
+def read_buses(cache, tracking_state, route_profiles):
     session = cache["session_id"]
     base = cache["base"]
     user = api(
@@ -959,24 +971,19 @@ def read_buses(cache, tracking_state, historical_profiles, route_profiles):
         samples = samples[-5:]
         prior_sample_count = len(samples)
 
-        backup_eta, eta_reason, closing_speed, closing_intervals = estimate_eta_from_history(
-            samples, stop_distance, now
+        # A fallback is allowed only after two recent, distinct GPS intervals
+        # show the bus moving toward the stop. Never derive a notification ETA
+        # from a straight-line speed or a broad distance/speed bucket.
+        backup_eta = None
+        eta_source = "unavailable"
+        eta_confidence = "unavailable"
+        eta_reason = "vendor_eta_present_or_route_evidence_unavailable"
+        closing_speed = None
+        _live_eta, movement_reason, closing_speed, closing_intervals = (
+            estimate_eta_from_history(samples, stop_distance, now)
         )
-        eta_source = "gps_movement" if backup_eta is not None else "unavailable"
-        eta_confidence = "medium" if backup_eta is not None else "unavailable"
-        historical_profile = None
-        # If fresh live GPS has at least one recent closing interval but not
-        # enough intervals for a live ETA, use this rider's prior-trip speed.
-        # Never use old-day speeds when today's bus location is stale or not
-        # currently moving toward the stop.
-        if backup_eta is None and gps_fresh and closing_intervals >= 1:
-            backup_eta, historical_profile = estimate_eta_from_prior_days(
-                historical_profiles, child_id, route, period, stop_distance
-            )
-            if backup_eta is not None:
-                eta_source = "historical_speed"
-                eta_confidence = historical_profile.get("confidence", "low")
-                eta_reason = "prior_days_median_speed"
+        if movement_reason != "need_more_closing_samples":
+            eta_reason = movement_reason
         if gps_fresh and stop_distance is not None:
             # Keep samples only from valid, fresh bus locations. Avoid storing
             # repeated identical coordinates, which create false zero speeds.
@@ -1167,38 +1174,50 @@ def read_buses(cache, tracking_state, historical_profiles, route_profiles):
         if is_past_stop:
             arrival_reason = "stop_already_passed_for_service_day"
 
+        vendor_eta_usable = app_eta is not None and 0 <= app_eta <= MAX_ETA_MINUTES
         route_prediction = None
-        if (gps_fresh and not is_past_stop and not near_now
-                and stop_distance is not None):
+        moving_toward_stop = bool(
+            gps_fresh and status == "current" and not is_past_stop
+            and not near_now and stop_distance is not None
+            and closing_intervals >= 2
+        )
+        if (not vendor_eta_usable and moving_toward_stop):
             route_prediction = estimate_eta_from_route_model(
                 route_profiles, child_id, route, period, lat, lon
             )
-        # Prefer live GPS motion over the historical route model. When live
-        # motion is not yet sufficient, a high-confidence route match can
-        # correct a vendor ETA that differs materially; app_eta_minutes is
-        # retained separately so the two estimates remain comparable.
-        vendor_eta_usable = app_eta is not None and 0 <= app_eta <= MAX_ETA_MINUTES
+        # Vendor ETA always wins. The fallback is published only when it is
+        # absent, the bus is moving on fresh GPS, and >=3 prior trips match.
         route_prediction_confident = bool(
             route_prediction
-            and route_prediction.get("matched_trip_days", 0) >= 5
+            and route_prediction.get("matched_trip_days", 0) >= 3
             and route_prediction.get("eta_max_minutes", MAX_ETA_MINUTES)
                 - route_prediction.get("eta_min_minutes", 0) <= 5
         )
-        route_prediction_conflicts_with_vendor = bool(
-            route_prediction_confident and vendor_eta_usable
-            and abs(route_prediction["eta_minutes"] - app_eta) >= 2
-        )
-        if (backup_eta is None and route_prediction
-                and route_prediction.get("eta_minutes") is not None
-                and (not vendor_eta_usable or route_prediction_conflicts_with_vendor)):
+        if (not vendor_eta_usable and moving_toward_stop
+                and route_prediction_confident
+                and route_prediction.get("eta_minutes") is not None):
             backup_eta = route_prediction["eta_minutes"]
             eta_source = "historical_route_match"
             eta_confidence = route_prediction["confidence"]
-            eta_reason = (
-                "high_confidence_route_overrode_vendor_eta"
-                if route_prediction_conflicts_with_vendor
-                else "matched_prior_route_positions"
-            )
+            eta_reason = "moving_on_recurrent_learned_route"
+        elif vendor_eta_usable:
+            eta_reason = "vendor_eta_available_fallback_suppressed"
+        elif not gps_fresh:
+            eta_reason = "gps_location_stale_or_missing"
+        elif not moving_toward_stop:
+            eta_reason = "waiting_for_two_fresh_moving_gps_intervals"
+        elif not route_prediction:
+            eta_reason = "no_recurrent_route_match_yet"
+        elif not route_prediction_confident:
+            eta_reason = "route_match_spread_too_wide"
+
+        school_origin = learned_school_origin(route_profiles, child_id, route, period)
+        school_distance = (
+            haversine_miles(lat, lon, *school_origin)
+            if gps_fresh and school_origin else None
+        )
+        at_school = bool(school_distance is not None and school_distance <= 0.10)
+        school_waiting = bool(at_school and not moving_toward_stop)
 
         if is_past_stop:
             past_stop_reason = (
@@ -1250,9 +1269,7 @@ def read_buses(cache, tracking_state, historical_profiles, route_profiles):
             "eta_calculated_by_ai": False,
             "eta_calculation_source": eta_source,
             "eta_calculation_method": {
-                "gps_movement": "recent_fresh_gps_movement",
-                "historical_speed": "prior_days_gps_speed",
-                "historical_route_match": "matched_prior_route_positions",
+                "historical_route_match": "three_day_recurrent_route_path",
                 "unavailable": "not_calculated",
             }.get(eta_source, "unknown"),
             "route_eta_minutes": route_prediction.get("eta_minutes")
@@ -1270,6 +1287,11 @@ def read_buses(cache, tracking_state, historical_profiles, route_profiles):
             "route_prediction_matched_trip_days": route_prediction.get("matched_trip_days")
             if route_prediction else 0,
             "route_prediction_calculated_by_ai": False,
+            "moving_toward_stop": moving_toward_stop,
+            "at_learned_school": at_school,
+            "school_waiting_for_departure": school_waiting,
+            "school_origin_distance_miles": round(school_distance, 3)
+            if school_distance is not None else None,
             "location_age_minutes": round(age, 1) if age is not None else None,
             "location_fresh": bool(gps_fresh),
             # Predicted coordinates are explicitly separated from observed GPS.
@@ -1321,9 +1343,11 @@ def read_buses(cache, tracking_state, historical_profiles, route_profiles):
             eta_source=eta_source,
             eta_calculated_by_ai=False,
             eta_confidence=eta_confidence,
-            historical_speed_profile=historical_profile,
             route_prediction=route_prediction,
             eta_reason=eta_reason,
+            moving_toward_stop=moving_toward_stop,
+            at_learned_school=at_school,
+            school_waiting_for_departure=school_waiting,
             arrival_likely=arrival_likely,
             arrival_reason=arrival_reason,
             is_at_stop=is_at_stop,
@@ -1397,7 +1421,6 @@ def main():
         }
     cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
     tracking_state = json.loads(TRACKING_STATE.read_text()) if TRACKING_STATE.exists() else {}
-    historical_profiles = load_historical_speed_profiles(started)
     route_profiles = load_route_model()
     log_event("route_model_loaded", profile_count=len(route_profiles),
               model_path=str(ROUTE_MODEL),
@@ -1408,7 +1431,7 @@ def main():
             cache = login(credentials, cache)
             log_event("login_succeeded", attempt=attempt + 1)
         try:
-            buses = read_buses(cache, tracking_state, historical_profiles, route_profiles)
+            buses = read_buses(cache, tracking_state, route_profiles)
             ai_analysis = load_ai_analysis()
             for bus in buses:
                 bus["ai_analysis"] = ai_analysis
