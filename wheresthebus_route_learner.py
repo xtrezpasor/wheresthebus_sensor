@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Last updated: 2026-10-14 07:46 AM EDT (America/New_York)
+# Last updated: 2026-10-14 01:20 PM EDT (America/New_York)
 """Build a private route-history model from Where's the Bus diagnostics.
 
 Run once daily, or manually with:
@@ -32,7 +32,7 @@ PAUSE_MIN_SECONDS = 75
 MAX_SAMPLE_GAP_MINUTES = 4
 MIN_TRIP_POINTS = 6
 MIN_MATCH_DISTANCE_MILES = 0.10
-MIN_TRIP_DAYS_FOR_PREDICTION = 2
+MIN_TRIP_DAYS_FOR_PREDICTION = 3
 MIN_DAYS_FOR_CONFIDENT_STOPS = 3
 MAX_POINTS_PER_TRIP = 120
 
@@ -113,6 +113,33 @@ def make_trip(rows):
         return None
     arrival = points[arrival_index]["at"]
     route_points = points[:arrival_index + 1]
+    # A bus commonly waits at school before starting the run. Recognize a
+    # sustained GPS cluster at the beginning of the trace, retain it as the
+    # learned school origin, and start route timing after the bus departs.
+    school_origin = None
+    origin_center = (route_points[0]["lat"], route_points[0]["lon"])
+    departure_index = None
+    for index, point in enumerate(route_points[1:], start=1):
+        gap = (point["at"] - route_points[index - 1]["at"]).total_seconds() / 60
+        if gap > MAX_SAMPLE_GAP_MINUTES:
+            break
+        moved = miles_between(*origin_center, point["lat"], point["lon"])
+        if moved > PAUSE_RADIUS_MILES:
+            dwell_seconds = (route_points[index - 1]["at"] - route_points[0]["at"]).total_seconds()
+            if dwell_seconds >= PAUSE_MIN_SECONDS:
+                origin_points = route_points[:index]
+                school_origin = {
+                    "latitude": round(median(p["lat"] for p in origin_points), 6),
+                    "longitude": round(median(p["lon"] for p in origin_points), 6),
+                    "dwell_minutes": round(dwell_seconds / 60, 1),
+                }
+                departure_index = index
+            break
+    if departure_index is not None:
+        route_points = route_points[departure_index:]
+        arrival = route_points[-1]["at"]
+    if len(route_points) < MIN_TRIP_POINTS:
+        return None
     if (route_points[-1]["at"] - route_points[0]["at"]).total_seconds() < 180:
         return None
 
@@ -176,6 +203,7 @@ def make_trip(rows):
         "arrival_at": arrival.isoformat(timespec="seconds"),
         "stop_lat": round(route_points[-1]["stop_lat"], 6),
         "stop_lon": round(route_points[-1]["stop_lon"], 6),
+        "school_origin": school_origin,
         "points": stored,
         "pauses": pauses,
     }
@@ -245,6 +273,17 @@ def build_model(now=None):
             "trip_days": len({trip["service_day"] for trip in trips}),
             "trips": trips,
             "probable_stops": consolidate_pauses(trips),
+            "school_origin": {
+                "latitude": round(median(
+                    trip["school_origin"]["latitude"] for trip in trips
+                    if trip.get("school_origin")
+                ), 6),
+                "longitude": round(median(
+                    trip["school_origin"]["longitude"] for trip in trips
+                    if trip.get("school_origin")
+                ), 6),
+                "days_seen": sum(1 for trip in trips if trip.get("school_origin")),
+            } if sum(1 for trip in trips if trip.get("school_origin")) >= 3 else None,
         }
     return {
         "generated_at": now.isoformat(timespec="seconds"),
