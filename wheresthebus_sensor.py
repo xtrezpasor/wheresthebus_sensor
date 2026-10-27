@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Last updated: 2026-10-14 01:20 PM EDT (America/New_York)
+# Last updated: 2026-10-27 (America/New_York)
 """Read WheresTheBus data for a Home Assistant command_line sensor.
 
 Adds AM/PM stop information and a strict learned-route ETA fallback. The vendor
@@ -51,6 +51,56 @@ LOCAL_TIMEZONE = ZoneInfo("America/New_York")
 # Optional rider names are read from the local credentials JSON. Keep real
 # names and rider IDs out of this public repository.
 CHILD_NAMES = {}
+EXPECTED_CHILDREN = {}
+
+
+def rider_identity(child_id, child_name, bus, route):
+    """Compare a live rider record with configured bus/route/ID identities."""
+    bus_text = str(bus or "").strip()
+    route_text = str(route or "").strip()
+    for name, expected in EXPECTED_CHILDREN.items():
+        if (str(expected.get("bus", "")).strip() == bus_text
+                and str(expected.get("route", "")).strip() == route_text):
+            expected_id = str(expected.get("child_id", "")).strip()
+            expected_name = str(name).strip()
+            actual_id = str(child_id).strip()
+            if actual_id != expected_id or child_name != expected_name:
+                return {
+                    "identity_status": "mismatch",
+                    "identity_expected_name": expected_name,
+                    "identity_expected_child_id": expected_id,
+                    "identity_issue": (
+                        f"{expected_name}: expected child ID {expected_id} "
+                        f"on bus {bus_text} route {route_text}; got ID "
+                        f"{actual_id} and name {child_name}"
+                    ),
+                }
+            return {
+                "identity_status": "ok",
+                "identity_expected_name": expected_name,
+                "identity_expected_child_id": expected_id,
+                "identity_issue": "",
+            }
+
+    if EXPECTED_CHILDREN and str(child_id).strip() not in {
+            str(item.get("child_id", "")).strip()
+            for item in EXPECTED_CHILDREN.values()}:
+        return {
+            "identity_status": "unknown",
+            "identity_expected_name": "",
+            "identity_expected_child_id": "",
+            "identity_issue": (
+                f"Unrecognized child ID {child_id} on bus {bus_text} "
+                f"route {route_text}; name is {child_name}"
+            ),
+        }
+
+    return {
+        "identity_status": "unconfigured",
+        "identity_expected_name": "",
+        "identity_expected_child_id": "",
+        "identity_issue": "",
+    }
 
 HISTORY_FIELDS = (
     "child_id", "child_name", "bus", "route", "distance",
@@ -1251,9 +1301,14 @@ def read_buses(cache, tracking_state, route_profiles):
         else:
             dropoff_reason = "no_recent_stop_proximity_sample"
 
+        child_name = CHILD_NAMES.get(child_id, "Unknown")
+        identity = rider_identity(
+            child_id, child_name, child.get("busNo"), route
+        )
         bus_record = {
             "child_id": child_id,
-            "child_name": CHILD_NAMES.get(child_id, "Unknown"),
+            "child_name": child_name,
+            **identity,
             "bus": child.get("busNo"),
             "route": route,
             # Kept for compatibility with existing Home Assistant automations.
@@ -1320,6 +1375,8 @@ def read_buses(cache, tracking_state, route_profiles):
             "child_assessment",
             child_id=child_id,
             child_name=bus_record["child_name"],
+            identity_status=identity["identity_status"],
+            identity_issue=identity["identity_issue"],
             bus=bus_record["bus"],
             route=route,
             status=status,
@@ -1409,7 +1466,7 @@ def record_history(buses, force=False):
 
 
 def main():
-    global RUN_ID, CHILD_NAMES
+    global RUN_ID, CHILD_NAMES, EXPECTED_CHILDREN
     RUN_ID = uuid4().hex[:10]
     started = datetime.now(timezone.utc)
     prune_diagnostic_logs()
@@ -1420,6 +1477,12 @@ def main():
         CHILD_NAMES = {
             int(child_id): str(name)
             for child_id, name in configured_names.items()
+        }
+    configured_expected = credentials.get("expected_children", {})
+    if isinstance(configured_expected, dict):
+        EXPECTED_CHILDREN = {
+            str(name): spec for name, spec in configured_expected.items()
+            if isinstance(spec, dict)
         }
     cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
     tracking_state = json.loads(TRACKING_STATE.read_text()) if TRACKING_STATE.exists() else {}
